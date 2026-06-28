@@ -2,7 +2,7 @@
 
 EVM spot trading namespace for the Authorization Object Network.
 
-Implements the `aon:evm-spot` namespace — spot trading on EVM without a reserve step, with partial fill support.
+Implements the `aon:evm-spot` namespace: spot trading on EVM without a reserve step, with partial fill support.
 
 ## Install
 
