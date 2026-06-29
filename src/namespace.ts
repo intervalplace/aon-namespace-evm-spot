@@ -1,5 +1,5 @@
 import type { NamespaceDriver } from "../index.js";
-import { findExecutableEvmSpotGraphs } from "../../executableEvmSpot.js";
+import { findExecutableEvmSpotGraphs } from "./executableEvmSpot.js";
 import { executeEvmSpotOnEvm } from "../../executors/evmSpotSettlement.js";
 
 export const evmSpotNamespace: NamespaceDriver = {

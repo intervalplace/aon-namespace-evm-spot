@@ -4,8 +4,8 @@
 // before submitting them to a node.
 
 import { getAddress, verifyTypedData, type Hex } from "viem";
-import { finalizeObject } from "@aon/sdk";
-import type { AonObject } from "@aon/sdk";
+import { finalizeObject } from "@intervalplace/aon-sdk";
+import type { AonObject } from "@intervalplace/aon-sdk";
 import { evmSpotNamespace } from "./namespace.js";
 
 function requireHex(x: any, code: string): Hex {
