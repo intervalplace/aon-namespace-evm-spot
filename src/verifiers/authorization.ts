@@ -1,5 +1,5 @@
 import { getAddress, verifyTypedData, type Address, type Hex } from "viem";
-import type { AonObject } from "../object.js";
+import type { AonObject } from "@intervalplace/aon-sdk";
 
 function stableStringify(x: any): string {
   if (x === null || typeof x !== "object") return JSON.stringify(x);
