@@ -1,5 +1,5 @@
 import { getAddress, verifyTypedData } from "viem";
-import type { AonObject } from "../object.js";
+import type { AonObject } from "@intervalplace/aon-sdk";
 
 export async function verifyObjectSignature(
   obj: AonObject
