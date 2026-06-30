@@ -4,9 +4,11 @@
 // before submitting them to a node.
 
 import { getAddress, verifyTypedData, type Hex } from "viem";
-import { finalizeObject } from "@intervalplace/aon-sdk";
+import { finalizeObject, nowMs } from "@intervalplace/aon-sdk";
 import type { AonObject } from "@intervalplace/aon-sdk";
-import { evmSpotNamespace } from "./namespace.js";
+import { evmSpotNamespace, type EvmSpotDriver } from "./namespace.js";
+
+const ns: EvmSpotDriver = evmSpotNamespace;
 
 function requireHex(x: any, code: string): Hex {
   if (typeof x !== "string" || !x.startsWith("0x")) throw new Error(code);
@@ -46,7 +48,7 @@ export async function buildEvmSpotAuthorizationObject(body: {
   references?: string[];
   summary?: string;
 }): Promise<AonObject> {
-  const authorization = evmSpotNamespace.normalizeAuthorization!(body.authorization);
+  const authorization = ns.normalizeAuthorization!(body.authorization);
   const signer = getAddress(body.signer ?? authorization.grantor);
 
   if (signer.toLowerCase() !== authorization.grantor.toLowerCase()) {
@@ -55,7 +57,7 @@ export async function buildEvmSpotAuthorizationObject(body: {
 
   await requireValidTypedSignature({
     domain: body.domain,
-    types: body.types ?? evmSpotNamespace.types!(),
+    types: body.types ?? ns.types!(),
     primaryType: body.primaryType ?? "TradingSessionAuthorization",
     message: authorization,
     signature: body.signature,
@@ -79,7 +81,7 @@ export async function buildEvmSpotAuthorizationObject(body: {
       scheme: "eip712",
       signer,
       domain: body.domain,
-      types: body.types ?? evmSpotNamespace.types!(),
+      types: body.types ?? ns.types!(),
       primaryType: body.primaryType ?? "TradingSessionAuthorization",
       message: authorization,
       signature: body.signature,
@@ -99,7 +101,7 @@ export async function buildEvmSpotOrderObject(body: {
   createdAt?: number;
   summary?: string;
 }): Promise<AonObject> {
-  const orderTypes = evmSpotNamespace.orderTypes!();
+  const orderTypes = ns.orderTypes!();
   const authHash = body.authorizationHash.toLowerCase();
 
   const order = {
@@ -211,7 +213,7 @@ export async function buildEvmSpotRevocationObject(
     createdAt?: number;
   }
 ): Promise<AonObject> {
-  const revocationTypes = evmSpotNamespace.revocationTypes!();
+  const revocationTypes = ns.revocationTypes!();
   const targetHash = body.targetHash.toLowerCase();
   const target = objects.find((o) => o.objectHash?.toLowerCase() === targetHash);
 
