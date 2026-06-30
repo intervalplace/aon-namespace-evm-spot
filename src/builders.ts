@@ -137,24 +137,24 @@ export async function buildEvmSpotOrderObject(body: {
     objectType: "order",
     schemaVersion: "1",
     namespace: "aon:evm-spot",
-    createdAt: body.createdAt ?? Date.now(),
+    createdAt: body.createdAt ?? nowMs(),
     creator: signer,
     references: [authHash],
     payload: {
       orderType: "evm_spot_order",
       order,
       summary: body.summary ?? null,
-      signature: {
-        scheme: "eip712",
-        signer,
-        domain: body.domain,
-        types: body.types ?? orderTypes,
-        primaryType: body.primaryType ?? "SignedOrder",
-        message: order,
-        signature: body.signature,
-      },
     },
-  });
+    signature: {
+      scheme: "eip712",
+      signer,
+      domain: body.domain,
+      types: body.types ?? orderTypes,
+      primaryType: body.primaryType ?? "SignedOrder",
+      message: order,
+      signature: body.signature,
+    },
+  } as any);
 }
 
 export function buildEvmSpotFillObject(body: {
