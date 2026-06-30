@@ -1,6 +1,6 @@
-import type { NamespaceDriver } from "../index.js";
+import type { NamespaceDriver } from "@intervalplace/aon-sdk";
 import { findExecutableEvmSpotGraphs } from "./executableEvmSpot.js";
-import { executeEvmSpotOnEvm } from "../../executors/evmSpotSettlement.js";
+import { executeEvmSpotOnEvm } from "./executors/evmSpotSettlement.js";
 
 export const evmSpotNamespace: NamespaceDriver = {
   namespace: "aon:evm-spot",
