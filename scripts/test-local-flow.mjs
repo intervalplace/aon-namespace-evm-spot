@@ -35,7 +35,7 @@ const maker = privateKeyToAccount(
 
 const taker = privateKeyToAccount(
   process.env.TAKER_PK ??
-    "0x59c6995e998f97a5a0044966f094538b3f50d8da019ff5f6347e10d7c5d525c68"
+    "0x59c6995e998f97a5a0044966f094538b3f50d8da019ff5f6347e10d7c5d525c6"
 );
 
 const now = Math.floor(Date.now() / 1000);
@@ -203,10 +203,10 @@ const fillObj = buildEvmSpotFillObject({
 
 await submit(fillObj, "fill");
 
-const graph = await client.walkGraph(makerAuthObj.objectHash);
+const allObjects = await client.listObjects({ namespace: "aon:evm-spot" });
 
 const namespace = getNamespace("aon:evm-spot");
-const evaluated = namespace.evaluate(graph.objects, {
+const evaluated = namespace.evaluate(allObjects, {
   includeCompleted: false,
 });
 
