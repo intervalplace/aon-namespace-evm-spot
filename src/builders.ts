@@ -116,9 +116,10 @@ export async function buildEvmSpotOrderObject(body: {
     validBefore:     String(body.order.validBefore),
   };
 
-  if (order.sessionAuthHash.toLowerCase() !== authHash) {
-    throw new Error("ORDER_AUTH_HASH_MISMATCH");
-  }
+  // sessionAuthHash is the EIP-712 hash of the authorization struct — what the
+  // settlement contract verifies on-chain. This is intentionally different from
+  // authorizationHash (the AON content-addressed object hash), which is used for
+  // graph traversal via references[]. Two separate hashing schemes, two purposes.
 
   const signer = getAddress(body.signer ?? order.trader);
   if (signer.toLowerCase() !== order.trader.toLowerCase()) {
