@@ -177,6 +177,13 @@ export async function executeEvmSpotOnEvm(args: { graph: any }) {
   const domain = graph.makerAuthorization.signature?.domain;
   if (!domain) throw new Error("MISSING_EIP712_DOMAIN");
 
+  // M20: Assert both parties signed for the same chain before any network call
+  const takerDomain = graph.takerAuthorization.signature?.domain;
+  if (!takerDomain) throw new Error("MISSING_TAKER_EIP712_DOMAIN");
+  if (Number(domain.chainId) !== Number(takerDomain.chainId)) {
+    throw new Error(`CHAIN_ID_MISMATCH: maker=${domain.chainId} taker=${takerDomain.chainId}`);
+  }
+
   const chainId = Number(domain.chainId);
   const chain = defineChain({
     id:             chainId,
