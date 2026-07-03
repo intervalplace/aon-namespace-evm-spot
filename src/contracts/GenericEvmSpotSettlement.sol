@@ -349,6 +349,10 @@ contract AonEvmSpotSettlement {
             revert InvalidPrice();
         }
 
+        // NOTE: Price is expressed as quote-per-base scaled by 1e18.
+        // This assumes the base token uses 18 decimal places.
+        // Tokens with non-18 decimals (e.g. USDC with 6) require a different
+        // price scaling — do not use this contract with such tokens as base.
         if ((fill.baseAmount * fill.price) / 1e18 != fill.quoteAmount) {
             revert InvalidPrice();
         }
@@ -414,6 +418,10 @@ contract AonEvmSpotSettlement {
         }
     }
 
+    // Secp256k1 half-order — s must be in the lower half to prevent malleability
+    uint256 private constant SECP256K1_HALF_ORDER =
+        0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0;
+
     function _recover(bytes32 digest, bytes calldata sig) internal pure returns (address) {
         if (sig.length != 65) revert BadSignature();
 
@@ -429,6 +437,8 @@ contract AonEvmSpotSettlement {
 
         if (v < 27) v += 27;
         if (v != 27 && v != 28) revert BadSignature();
+        // Reject upper-half s values (EIP-2 / OpenZeppelin ECDSA practice)
+        if (uint256(s) > SECP256K1_HALF_ORDER) revert BadSignature();
 
         address signer = ecrecover(digest, v, r, s);
         if (signer == address(0)) revert BadSignature();
