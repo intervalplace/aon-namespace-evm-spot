@@ -46,7 +46,6 @@ export async function buildEvmSpotAuthorizationObject(body: {
   namespace?: string;
   createdAt?: number;
   references?: string[];
-  summary?: string;
 }): Promise<AonObject> {
   const authorization = ns.normalizeAuthorization!(body.authorization);
   const signer = getAddress(body.signer ?? authorization.grantor);
@@ -70,12 +69,10 @@ export async function buildEvmSpotAuthorizationObject(body: {
     schemaVersion: "1",
     namespace: body.namespace ?? "aon:evm-spot",
     createdAt: body.createdAt ?? Date.now(),
-    creator: signer,
     references: body.references ?? [],
     payload: {
       authorizationType: "evm_spot_session",
       authorization,
-      summary: body.summary ?? null,
     },
     signature: {
       scheme: "eip712",
@@ -99,7 +96,6 @@ export async function buildEvmSpotOrderObject(body: {
   primaryType?: string;
   signer?: string;
   createdAt?: number;
-  summary?: string;
 }): Promise<AonObject> {
   const orderTypes = ns.orderTypes!();
   const authHash = body.authorizationHash.toLowerCase();
@@ -141,12 +137,10 @@ export async function buildEvmSpotOrderObject(body: {
     schemaVersion: "1",
     namespace: "aon:evm-spot",
     createdAt: body.createdAt ?? nowMs(),
-    creator: signer,
     references: [authHash],
     payload: {
       orderType: "evm_spot_order",
       order,
-      summary: body.summary ?? null,
     },
     signature: {
       scheme: "eip712",
@@ -166,9 +160,7 @@ export function buildEvmSpotFillObject(body: {
   makerOrderHash: string;
   takerOrderHash: string;
   fill: any;
-  creator?: string;
   createdAt?: number;
-  summary?: string;
 }): AonObject {
   const makerAuthorizationHash = body.makerAuthorizationHash.toLowerCase();
   const takerAuthorizationHash = body.takerAuthorizationHash.toLowerCase();
@@ -193,12 +185,10 @@ export function buildEvmSpotFillObject(body: {
     schemaVersion: "1",
     namespace: "aon:evm-spot",
     createdAt: body.createdAt ?? Date.now(),
-    creator: body.creator ?? "aon-matcher-v0",
     references: [makerAuthorizationHash, takerAuthorizationHash, makerOrderHash, takerOrderHash],
     payload: {
       fillType: "evm_spot_fill",
       fill,
-      summary: body.summary ?? null,
     },
   });
 }
@@ -227,8 +217,7 @@ export async function buildEvmSpotRevocationObject(
   if (alreadyRevoked) throw new Error("TARGET_ALREADY_REVOKED");
 
   const signer = body.signer ??
-    (target.payload as any)?.authorization?.grantor ??
-    target.creator;
+    (target.payload as any)?.authorization?.grantor;
 
   const reason = body.reason ?? "user_revoked";
   const nonce  = requireHex(body.nonce ?? body.signature?.message?.nonce, "MISSING_REVOCATION_NONCE");
@@ -250,7 +239,6 @@ export async function buildEvmSpotRevocationObject(
     schemaVersion: "1",
     namespace: target.namespace,
     createdAt: body.createdAt ?? Date.now(),
-    creator: signer,
     references: [targetHash],
     payload: {
       revocationType: `${target.objectType}_revocation`,
