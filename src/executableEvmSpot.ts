@@ -97,31 +97,50 @@ export function findExecutableEvmSpotGraphs(
       o.objectType === "receipt"
   );
 
+  const revocations = objects.filter(
+    (o: any) =>
+      o.namespace === "aon:evm-spot" &&
+      o.objectType === "revocation"
+  );
+
+  // Build revocation set for O(1) lookup
+  const revokedHashes = new Set<string>();
+  for (const rev of revocations) {
+    for (const ref of (rev.references ?? [])) {
+      revokedHashes.add(ref.toLowerCase());
+    }
+  }
+
   const out = [];
 
   for (const fill of fills) {
     if (!fill.objectHash) continue;
 
-    const refs = refsLower(fill);
-    if (refs.length < 4) continue;
+    // H6: Match objects against payload fields, not reference array position.
+    // Reference ordering is an implementation detail that could change.
+    const fp = fill.payload?.fill ?? {};
 
     const makerAuth = authorizations.find(
-      (o: any) => o.objectHash?.toLowerCase() === refs[0]
+      (o: any) => o.objectHash?.toLowerCase() === fp.makerAuthHash?.toLowerCase()
     );
 
     const takerAuth = authorizations.find(
-      (o: any) => o.objectHash?.toLowerCase() === refs[1]
+      (o: any) => o.objectHash?.toLowerCase() === fp.takerAuthHash?.toLowerCase()
     );
 
     const makerOrder = orders.find(
-      (o: any) => o.objectHash?.toLowerCase() === refs[2]
+      (o: any) => o.objectHash?.toLowerCase() === fp.makerOrderHash?.toLowerCase()
     );
 
     const takerOrder = orders.find(
-      (o: any) => o.objectHash?.toLowerCase() === refs[3]
+      (o: any) => o.objectHash?.toLowerCase() === fp.takerOrderHash?.toLowerCase()
     );
 
     if (!makerAuth || !takerAuth || !makerOrder || !takerOrder) continue;
+
+    // H8/M19: Skip fills where either authorization has been revoked
+    if (revokedHashes.has(makerAuth.objectHash!.toLowerCase())) continue;
+    if (revokedHashes.has(takerAuth.objectHash!.toLowerCase())) continue;
 
     const receipt = receipts.find((r: any) => receiptConsumesFill(r, fill));
 
