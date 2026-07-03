@@ -2,6 +2,7 @@ import type { NamespaceDriver } from "@intervalplace/aon-sdk";
 import { getAddress } from "viem";
 import { findExecutableEvmSpotGraphs } from "./executableEvmSpot.js";
 import { executeEvmSpotOnEvm } from "./executors/evmSpotSettlement.js";
+import { verifyAuthorizationObject } from "./verifiers/authorization.js";
 
 // ── Extended driver type ───────────────────────────────────────────────────────
 // The SDK's NamespaceDriver defines the minimum contract for the registry.
@@ -127,6 +128,14 @@ export const evmSpotNamespace: EvmSpotDriver = {
       proofType: "evm_spot_fill",
       reason: "EVM_SPOT_VERIFIED_BY_NAMESPACE",
     };
+  },
+
+  async validateObject(obj: any) {
+    // Wire the authorization verifier — cross-checks payload.authorization
+    // against signature.message before the object is accepted by the node
+    if (obj.objectType === "authorization") {
+      await verifyAuthorizationObject(obj);
+    }
   },
 
   async execute(graph: any, args?: { mode?: "off" | "simulate" | "contract" }) {
