@@ -6,7 +6,7 @@ export async function verifyObjectSignature(
 ) {
   const sig = (obj as any).signature;
 
-  if (!sig) return;
+  if (!sig) throw new Error("MISSING_SIGNATURE");
 
   const ok = await verifyTypedData({
     address: getAddress(sig.signer),
