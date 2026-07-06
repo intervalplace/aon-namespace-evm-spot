@@ -1,8 +1,9 @@
 import type { NamespaceDriver } from "@intervalplace/aon-sdk";
-import { getAddress } from "viem";
 import { findExecutableEvmSpotGraphs } from "./executableEvmSpot.js";
 import { executeEvmSpotOnEvm } from "./executors/evmSpotSettlement.js";
 import { verifyAuthorizationObject } from "./verifiers/authorization.js";
+import { finalizeObject } from "@intervalplace/aon-sdk";
+import { getAddress } from "viem";
 
 // ── Extended driver type ───────────────────────────────────────────────────────
 // The SDK's NamespaceDriver defines the minimum contract for the registry.
@@ -160,7 +161,27 @@ export const evmSpotNamespace: EvmSpotDriver = {
     }
 
     if (mode === "contract") {
-      return await executeEvmSpotOnEvm({ graph });
+      const result = await executeEvmSpotOnEvm({ graph });
+
+      const refs = [
+        graph.fill?.objectHash,
+        graph.makerAuthorization?.objectHash,
+        graph.takerAuthorization?.objectHash,
+      ].filter(Boolean);
+
+      const receiptObject = finalizeObject({
+        objectType:    "receipt",
+        schemaVersion: "1",
+        namespace:     "aon:evm-spot",
+        createdAt:     Date.now(),
+        references:    refs,
+        payload: {
+          receiptType: "authorized_state_transition_completed",
+          executionTx: result.executionTx,
+        },
+      });
+
+      return { ...result, receiptObject };
     }
 
     throw new Error("UNKNOWN_EXECUTOR_MODE");

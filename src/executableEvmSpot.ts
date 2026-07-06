@@ -118,7 +118,10 @@ export function findExecutableEvmSpotGraphs(
 
     // H6: Match objects against payload fields, not reference array position.
     // Reference ordering is an implementation detail that could change.
-    const fp = fill.payload?.fill ?? {};
+    const fp = fill.payload?.fill as {
+      makerAuthHash?: string; takerAuthHash?: string;
+      makerOrderHash?: string; takerOrderHash?: string;
+    } ?? {};
 
     const makerAuth = authorizations.find(
       (o: any) => o.objectHash?.toLowerCase() === fp.makerAuthHash?.toLowerCase()
