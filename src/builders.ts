@@ -110,6 +110,8 @@ export async function buildEvmSpotOrderObject(body: {
     sessionAuthHash: requireHex(body.order.sessionAuthHash, "INVALID_SESSION_AUTH_HASH"),
     validAfter:      String(body.order.validAfter),
     validBefore:     String(body.order.validBefore),
+    // Buy orders only: be paid in native ETH instead of WETH
+    receiveNative:   body.order.receiveNative === true,
   };
 
   // sessionAuthHash is the EIP-712 hash of the authorization struct — what the

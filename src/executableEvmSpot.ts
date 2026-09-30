@@ -17,15 +17,17 @@ function fillData(fill: any) {
   return fill.payload?.fill ?? fill.payload ?? {};
 }
 
+// A receipt consumes a fill only if it references the fill AND carries the
+// fill's nonce (checked against the chain in validateReceiptObject).
 function receiptConsumesFill(receipt: any, fill: any) {
   const fillHash = fill.objectHash?.toLowerCase?.();
   const nonce = fillData(fill).fillNonce?.toLowerCase?.();
-
-  return (
-    (fillHash && refsLower(receipt).includes(fillHash)) ||
-    (nonce && receipt.payload?.fillNonce?.toLowerCase?.() === nonce) ||
-    (nonce && receipt.payload?.execution?.fillNonce?.toLowerCase?.() === nonce)
-  );
+  if (!fillHash || !nonce) return false;
+  if (!refsLower(receipt).includes(fillHash)) return false;
+  if (receipt.payload?.fillNonce?.toLowerCase?.() !== nonce) return false;
+  // …and the event must come from the contract this fill settles on
+  const contract = fillData(fill).settlementContract?.toLowerCase?.();
+  return !!contract && receipt.payload?.settlementContract?.toLowerCase?.() === contract;
 }
 
 function isFillReceipted(receipts: any[], fill: any) {
@@ -66,6 +68,29 @@ function sumReceiptedBaseForOrder(args: {
   return total;
 }
 
+// ── Failure backoff ───────────────────────────────────────────────────────────
+// A fill can be structurally valid yet fail on-chain (a party lacks balance,
+// another executor already settled it, ...). Back off exponentially instead
+// of retrying every poll.
+
+const failures = new Map<string, { count: number; retryAt: number }>();
+const BACKOFF_BASE_MS = 30_000;
+const BACKOFF_MAX_MS = 30 * 60_000;
+
+export function recordFillFailure(fillHash?: string) {
+  if (!fillHash) return;
+  const k = fillHash.toLowerCase();
+  const count = (failures.get(k)?.count ?? 0) + 1;
+  const delay = Math.min(BACKOFF_BASE_MS * 2 ** (count - 1), BACKOFF_MAX_MS);
+  failures.set(k, { count, retryAt: Date.now() + delay });
+}
+export function clearFillFailure(fillHash?: string) {
+  if (fillHash) failures.delete(fillHash.toLowerCase());
+}
+const inBackoff = (fillHash: string) => (failures.get(fillHash.toLowerCase())?.retryAt ?? 0) > Date.now();
+
+const lower = (x: any) => String(x ?? "").toLowerCase();
+
 export function findExecutableEvmSpotGraphs(
   objects: AonObject[],
   opts?: { includeCompleted?: boolean }
@@ -103,13 +128,23 @@ export function findExecutableEvmSpotGraphs(
       o.objectType === "revocation"
   );
 
-  // Build revocation set for O(1) lookup
+  // Revocations only count when signed by the owner of the target:
+  // the grantor for an authorization, the trader for an order.
+  // (Signature validity itself is checked in validateObject.)
+  const ownerOf = new Map<string, string>();
+  for (const a of authorizations) ownerOf.set(lower(a.objectHash), lower((a.payload as any)?.authorization?.grantor));
+  for (const o of orders)         ownerOf.set(lower(o.objectHash), lower((o.payload as any)?.order?.trader));
+
   const revokedHashes = new Set<string>();
   for (const rev of revocations) {
-    for (const ref of (rev.references ?? [])) {
-      revokedHashes.add(ref.toLowerCase());
-    }
+    const p = (rev.payload as any) ?? {};
+    const target = lower(p.targetHash);
+    const owner = ownerOf.get(target);
+    if (owner && owner === lower(p.signature?.signer)) revokedHashes.add(target);
   }
+
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const expired = (x: any) => Number(x?.validBefore ?? 0) < nowSecs || Number(x?.validAfter ?? 0) > nowSecs;
 
   const out = [];
 
@@ -141,9 +176,18 @@ export function findExecutableEvmSpotGraphs(
 
     if (!makerAuth || !takerAuth || !makerOrder || !takerOrder) continue;
 
-    // H8/M19: Skip fills where either authorization has been revoked
-    if (revokedHashes.has(makerAuth.objectHash!.toLowerCase())) continue;
-    if (revokedHashes.has(takerAuth.objectHash!.toLowerCase())) continue;
+    // Orders must belong to the authorizations the fill names
+    if (!refsLower(makerOrder).includes(lower(makerAuth.objectHash))) continue;
+    if (!refsLower(takerOrder).includes(lower(takerAuth.objectHash))) continue;
+
+    // H8/M19: Skip fills where an authorization or order has been revoked
+    if ([makerAuth, takerAuth, makerOrder, takerOrder].some((o: any) => revokedHashes.has(lower(o.objectHash)))) continue;
+
+    // All four objects must name the same settlement contract
+    const ma = (makerAuth.payload as any).authorization, ta = (takerAuth.payload as any).authorization;
+    const sc = lower(ma?.settlementContract);
+    if (!sc || lower(ta?.settlementContract) !== sc) continue;
+    if (fp && (fp as any).settlementContract && lower((fp as any).settlementContract) !== sc) continue;
 
     const receipt = receipts.find((r: any) => receiptConsumesFill(r, fill));
 
@@ -185,6 +229,12 @@ export function findExecutableEvmSpotGraphs(
         : "executable";
 
     if (!opts?.includeCompleted && status !== "executable") continue;
+
+    // Don't hand the executor work the contract will reject anyway
+    if (status === "executable") {
+      if ([ma, ta, (makerOrder.payload as any).order, (takerOrder.payload as any).order].some(expired)) continue;
+      if (inBackoff(fill.objectHash)) continue;
+    }
 
     out.push({
       status,

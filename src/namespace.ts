@@ -2,6 +2,8 @@ import type { NamespaceDriver } from "@intervalplace/aon-sdk";
 import { findExecutableEvmSpotGraphs } from "./executableEvmSpot.js";
 import { executeEvmSpotOnEvm } from "./executors/evmSpotSettlement.js";
 import { verifyAuthorizationObject } from "./verifiers/authorization.js";
+import { validateOrderObject, validateFillObject, validateRevocationObject, validateReceiptObject } from "./validators/objects.js";
+import { recordFillFailure, clearFillFailure } from "./executableEvmSpot.js";
 import { finalizeObject } from "@intervalplace/aon-sdk";
 import { getAddress } from "viem";
 
@@ -53,6 +55,7 @@ const ORDER_TYPES = {
     { name: "sessionAuthHash", type: "bytes32" },
     { name: "validAfter",      type: "uint64"  },
     { name: "validBefore",     type: "uint64"  },
+    { name: "receiveNative",   type: "bool"    },
   ],
 };
 
@@ -109,11 +112,11 @@ export const evmSpotNamespace: EvmSpotDriver = {
 
     const f = graph.fill?.payload?.fill ?? {};
 
+    // Amount is in raw quote-token units. The namespace doesn't know token
+    // metadata, so symbol/decimals are left for the caller to resolve.
     return {
       token: a.quoteToken,
       amount: String(f.executorFeeQuoteAmount ?? "0"),
-      tokenSymbol: "QUOTE",
-      decimals: 18,
     };
   },
 
@@ -134,8 +137,12 @@ export const evmSpotNamespace: EvmSpotDriver = {
   async validateObject(obj: any) {
     // Wire the authorization verifier — cross-checks payload.authorization
     // against signature.message before the object is accepted by the node
-    if (obj.objectType === "authorization") {
-      await verifyAuthorizationObject(obj);
+    switch (obj.objectType) {
+      case "authorization": return verifyAuthorizationObject(obj);
+      case "order":         return validateOrderObject(obj);
+      case "fill":          return validateFillObject(obj);
+      case "revocation":    return validateRevocationObject(obj);
+      case "receipt":       return validateReceiptObject(obj);
     }
   },
 
@@ -161,7 +168,16 @@ export const evmSpotNamespace: EvmSpotDriver = {
     }
 
     if (mode === "contract") {
-      const result = await executeEvmSpotOnEvm({ graph });
+      let result;
+      try {
+        result = await executeEvmSpotOnEvm({ graph });
+      } catch (err) {
+        // Back off this fill so a permanently failing match (e.g. the seller
+        // moved their tokens) isn't retried on every poll.
+        recordFillFailure(graph.fill?.objectHash);
+        throw err;
+      }
+      clearFillFailure(graph.fill?.objectHash);
 
       const refs = [
         graph.fill?.objectHash,
@@ -178,6 +194,9 @@ export const evmSpotNamespace: EvmSpotDriver = {
         payload: {
           receiptType: "authorized_state_transition_completed",
           executionTx: result.executionTx,
+          // Binds the receipt to one fill so it can be checked on-chain
+          fillNonce: graph.fill?.payload?.fill?.fillNonce,
+          settlementContract: result.details?.settlementContract,
         },
       });
 
