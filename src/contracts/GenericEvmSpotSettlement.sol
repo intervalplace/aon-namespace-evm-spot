@@ -1,16 +1,27 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+interface IWETH {
+    function withdraw(uint256 amount) external;
+}
+
 contract AonEvmSpotSettlement {
     bytes32 public constant AUTH_TYPEHASH = keccak256(
         "TradingSessionAuthorization(address grantor,address settlementContract,address baseToken,address quoteToken,bytes32 marketId,uint8 sideMask,uint256 maxBaseExposure,uint256 maxQuoteExposure,uint256 maxExecutorFeeQuote,uint256 minPrice,uint256 maxPrice,uint64 validAfter,uint64 validBefore,bytes32 authNonce)"
     );
 
     bytes32 public constant ORDER_TYPEHASH = keccak256(
-        "SignedOrder(address trader,bytes32 marketId,uint8 side,uint256 price,uint256 baseAmount,bytes32 orderNonce,bytes32 sessionAuthHash,uint64 validAfter,uint64 validBefore)"
+        "SignedOrder(address trader,bytes32 marketId,uint8 side,uint256 price,uint256 baseAmount,bytes32 orderNonce,bytes32 sessionAuthHash,uint64 validAfter,uint64 validBefore,bool receiveNative)"
     );
 
     bytes32 private immutable DOMAIN_SEPARATOR;
+
+    /// Wrapped native token (WETH on Ethereum). A buy order with
+    /// receiveNative = true in a market whose base token is this address is
+    /// paid out in native ETH. address(0) disables native payouts.
+    address public immutable WRAPPED_NATIVE;
+
+    uint256 private _lock = 1;
 
     uint8 public constant SIDE_SELL_BASE = 0;
     uint8 public constant SIDE_BUY_BASE = 1;
@@ -51,6 +62,9 @@ contract AonEvmSpotSettlement {
         bytes32 sessionAuthHash;
         uint64 validAfter;
         uint64 validBefore;
+        // Buy orders only: receive the base token as native ETH (base must be
+        // WRAPPED_NATIVE). Signed, so no one else can choose it for the buyer.
+        bool receiveNative;
     }
 
     struct FillInstruction {
@@ -102,8 +116,20 @@ contract AonEvmSpotSettlement {
     error OrderAmountExceeded(bytes32 orderHash);
     error FillReplay(bytes32 fillNonce);
     error TransferFailed();
+    error NativePayoutNotAllowed();
+    error NativeTransferFailed();
+    error Reentrancy();
+    error ZeroAmount();
 
-    constructor() {
+    modifier nonReentrant() {
+        if (_lock != 1) revert Reentrancy();
+        _lock = 2;
+        _;
+        _lock = 1;
+    }
+
+    constructor(address wrappedNative) {
+        WRAPPED_NATIVE = wrappedNative;
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
@@ -113,6 +139,11 @@ contract AonEvmSpotSettlement {
                 address(this)
             )
         );
+    }
+
+    /// Only accepts ETH from the wrapped-native contract while unwrapping.
+    receive() external payable {
+        if (msg.sender != WRAPPED_NATIVE) revert NativeTransferFailed();
     }
 
     function domainSeparator() external view returns (bytes32) {
@@ -159,7 +190,8 @@ contract AonEvmSpotSettlement {
                 order.orderNonce,
                 order.sessionAuthHash,
                 order.validAfter,
-                order.validBefore
+                order.validBefore,
+                order.receiveNative
             )
         );
 
@@ -194,7 +226,9 @@ contract AonEvmSpotSettlement {
         SignedOrder calldata takerOrder,
         bytes calldata takerOrderSig,
         FillInstruction calldata fill
-    ) external {
+    ) external nonReentrant {
+        if (fill.baseAmount == 0) revert ZeroAmount();
+
         bytes32 makerAuthHash = hashTradingSessionAuthorization(makerAuth);
         bytes32 takerAuthHash = hashTradingSessionAuthorization(takerAuth);
         bytes32 makerOrderHash = hashSignedOrder(makerOrder);
@@ -243,7 +277,10 @@ contract AonEvmSpotSettlement {
             revert InvalidSide();
         }
 
-        _safeTransferFrom(makerAuth.baseToken, seller, buyer, fill.baseAmount);
+        bool payNative = (makerOrder.side == SIDE_BUY_BASE ? makerOrder : takerOrder).receiveNative;
+
+        // Quote legs first; the native payout (an external call to the buyer)
+        // goes last, after every state change and token transfer.
         _safeTransferFrom(makerAuth.quoteToken, buyer, seller, fill.quoteAmount);
 
         if (fill.executorFeeQuoteAmount > 0) {
@@ -253,6 +290,15 @@ contract AonEvmSpotSettlement {
                 msg.sender,
                 fill.executorFeeQuoteAmount
             );
+        }
+
+        if (payNative) {
+            _safeTransferFrom(makerAuth.baseToken, seller, address(this), fill.baseAmount);
+            IWETH(WRAPPED_NATIVE).withdraw(fill.baseAmount);
+            (bool sent, ) = buyer.call{value: fill.baseAmount}("");
+            if (!sent) revert NativeTransferFailed();
+        } else {
+            _safeTransferFrom(makerAuth.baseToken, seller, buyer, fill.baseAmount);
         }
 
         emit OrderFilled(makerOrderHash, fill.baseAmount, filledBaseByOrder[makerOrderHash]);
@@ -304,6 +350,11 @@ contract AonEvmSpotSettlement {
         if (order.marketId != auth.marketId) revert InvalidMarket();
         if (order.sessionAuthHash != authHash) revert InvalidMarket();
         if (cancelledOrder[orderHash]) revert OrderCancelledError(orderHash);
+
+        if (order.receiveNative) {
+            if (order.side != SIDE_BUY_BASE) revert NativePayoutNotAllowed();
+            if (WRAPPED_NATIVE == address(0) || auth.baseToken != WRAPPED_NATIVE) revert NativePayoutNotAllowed();
+        }
 
         if (block.timestamp < order.validAfter || block.timestamp > order.validBefore) {
             revert OrderExpired(orderHash);
@@ -402,6 +453,9 @@ contract AonEvmSpotSettlement {
         address to,
         uint256 amount
     ) internal {
+        // A call to an address with no code "succeeds" with empty return data
+        if (token.code.length == 0) revert TransferFailed();
+
         (bool ok, bytes memory data) = token.call(
             abi.encodeWithSelector(
                 bytes4(keccak256("transferFrom(address,address,uint256)")),
