@@ -73,7 +73,8 @@ console.log("=== evm-spot Full On-Chain Integration Test ===\n");
 console.log("[1] Deploying contracts...");
 const baseTokenAddr  = await deploy(MockUSDC);
 const quoteTokenAddr = await deploy(MockUSDC);
-const settlementAddr = await deploy(AonEvmSpotSettlement);
+// No wrapped-native token in this test: native payouts disabled
+const settlementAddr = await deploy(AonEvmSpotSettlement, ["0x0000000000000000000000000000000000000000"]);
 console.log("  baseToken:   ", baseTokenAddr);
 console.log("  quoteToken:  ", quoteTokenAddr);
 console.log("  settlement:  ", settlementAddr);
@@ -173,6 +174,7 @@ const makerOrderStruct = {
   sessionAuthHash: makerAuthEip712,  // EIP-712 hash — what the contract verifies
   validAfter:      String(now - 60),
   validBefore:     String(now + 3600),
+  receiveNative:   false,
 };
 
 const makerOrderSig = await maker.signTypedData({
@@ -198,6 +200,7 @@ const takerOrderStruct = {
   sessionAuthHash: takerAuthEip712,  // EIP-712 hash — what the contract verifies
   validAfter:      String(now - 60),
   validBefore:     String(now + 3600),
+  receiveNative:   false,
 };
 
 const takerOrderSig = await taker.signTypedData({
@@ -293,6 +296,7 @@ const orderTuple = (s) => ({
   sessionAuthHash: s.sessionAuthHash,
   validAfter:      BigInt(s.validAfter),
   validBefore:     BigInt(s.validBefore),
+  receiveNative:   s.receiveNative === true,
 });
 
 const mAuth = executable.makerAuthorization.payload.authorization;

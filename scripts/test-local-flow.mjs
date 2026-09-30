@@ -89,8 +89,8 @@ await submit(makerAuthObj, "maker authorization");
 await submit(takerAuthObj, "taker authorization");
 
 // ── Orders (1.0 base each) ────────────────────────────────────────────────────
-const makerOrderStruct = { trader: maker.address, marketId, side: 0, price: e18(1), baseAmount: e18(1), orderNonce: hex32("dd"), sessionAuthHash: makerAuthObj.objectHash, validAfter: String(now - 60), validBefore: String(now + 3600) };
-const takerOrderStruct = { trader: taker.address, marketId, side: 1, price: e18(1), baseAmount: e18(1), orderNonce: hex32("ee"), sessionAuthHash: takerAuthObj.objectHash, validAfter: String(now - 60), validBefore: String(now + 3600) };
+const makerOrderStruct = { trader: maker.address, marketId, side: 0, price: e18(1), baseAmount: e18(1), orderNonce: hex32("dd"), sessionAuthHash: makerAuthObj.objectHash, validAfter: String(now - 60), validBefore: String(now + 3600), receiveNative: false };
+const takerOrderStruct = { trader: taker.address, marketId, side: 1, price: e18(1), baseAmount: e18(1), orderNonce: hex32("ee"), sessionAuthHash: takerAuthObj.objectHash, validAfter: String(now - 60), validBefore: String(now + 3600), receiveNative: false };
 
 const makerOrderObj = await buildEvmSpotOrderObject({ authorizationHash: makerAuthObj.objectHash, authorization: makerAuthObj, order: makerOrderStruct, signature: await maker.signTypedData({ domain, types: orderTypes, primaryType: "SignedOrder", message: makerOrderStruct }), signer: maker.address, domain });
 const takerOrderObj = await buildEvmSpotOrderObject({ authorizationHash: takerAuthObj.objectHash, authorization: takerAuthObj, order: takerOrderStruct, signature: await taker.signTypedData({ domain, types: orderTypes, primaryType: "SignedOrder", message: takerOrderStruct }), signer: taker.address, domain });
