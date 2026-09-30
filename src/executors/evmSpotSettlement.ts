@@ -50,6 +50,7 @@ const abi = [
           { name: "sessionAuthHash", type: "bytes32" },
           { name: "validAfter",      type: "uint64"  },
           { name: "validBefore",     type: "uint64"  },
+          { name: "receiveNative",   type: "bool"    },
         ],
       },
       { name: "makerOrderSig", type: "bytes" },
@@ -85,6 +86,7 @@ const abi = [
           { name: "sessionAuthHash", type: "bytes32" },
           { name: "validAfter",      type: "uint64"  },
           { name: "validBefore",     type: "uint64"  },
+          { name: "receiveNative",   type: "bool"    },
         ],
       },
       { name: "takerOrderSig", type: "bytes" },
@@ -150,6 +152,7 @@ function orderTuple(o: any) {
     sessionAuthHash: asHex(o.sessionAuthHash, "INVALID_SESSION_AUTH_HASH"),
     validAfter:      BigInt(o.validAfter),
     validBefore:     BigInt(o.validBefore),
+    receiveNative:   o.receiveNative === true,
   };
 }
 
@@ -196,11 +199,14 @@ export async function executeEvmSpotOnEvm(args: { graph: any }) {
   const wallet  = createWalletClient({ account, chain, transport: http(rpcUrl) });
   const pub     = createPublicClient({           chain, transport: http(rpcUrl) });
 
-  const contract = getAddress(
-    fill.settlementContract ??
-    makerAuth.settlementContract ??
-    requireEnv("AON_EVM_SPOT_SETTLEMENT_CONTRACT")
-  );
+  // The contract to call comes from what both parties signed, never from the
+  // (unsigned) fill. All sources must agree, and the executor can pin it.
+  const contract = getAddress(makerAuth.settlementContract);
+  const candidates = [takerAuth.settlementContract, domain.verifyingContract, takerDomain.verifyingContract, fill.settlementContract]
+    .filter(Boolean).map((x: string) => x.toLowerCase());
+  if (candidates.some((c) => c !== contract.toLowerCase())) throw new Error("SETTLEMENT_CONTRACT_MISMATCH");
+  const pinned = process.env.AON_EVM_SPOT_SETTLEMENT_CONTRACT;
+  if (pinned && pinned.toLowerCase() !== contract.toLowerCase()) throw new Error("SETTLEMENT_CONTRACT_NOT_ALLOWED");
 
   // Recompute EIP-712 hashes for the fill instruction.
   // The hashes stored in the AON fill payload are AON content-addressed hashes
@@ -240,6 +246,8 @@ export async function executeEvmSpotOnEvm(args: { graph: any }) {
   });
 
   const receipt = await pub.waitForTransactionReceipt({ hash: tx, confirmations: 1 });
+  // A reverted tx (e.g. another executor settled first) must not produce a receipt
+  if (receipt.status !== "success") throw new Error(`SETTLEMENT_REVERTED: ${tx}`);
 
   return {
     executed:    true,
