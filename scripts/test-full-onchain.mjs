@@ -175,6 +175,9 @@ const makerOrderStruct = {
   validAfter:      String(now - 60),
   validBefore:     String(now + 3600),
   receiveNative:   false,
+  counterSetHash:  "0x" + "00".repeat(32),
+  exclusiveBase:   "0",
+  exclusiveUntil:  "0",
 };
 
 const makerOrderSig = await maker.signTypedData({
@@ -201,6 +204,9 @@ const takerOrderStruct = {
   validAfter:      String(now - 60),
   validBefore:     String(now + 3600),
   receiveNative:   false,
+  counterSetHash:  "0x" + "00".repeat(32),
+  exclusiveBase:   "0",
+  exclusiveUntil:  "0",
 };
 
 const takerOrderSig = await taker.signTypedData({
@@ -297,6 +303,9 @@ const orderTuple = (s) => ({
   validAfter:      BigInt(s.validAfter),
   validBefore:     BigInt(s.validBefore),
   receiveNative:   s.receiveNative === true,
+  counterSetHash:  s.counterSetHash,
+  exclusiveBase:   BigInt(s.exclusiveBase),
+  exclusiveUntil:  BigInt(s.exclusiveUntil),
 });
 
 const mAuth = executable.makerAuthorization.payload.authorization;
@@ -315,6 +324,8 @@ const fillTuple = {
   quoteAmount:            BigInt(fill.quoteAmount),
   executorFeeQuoteAmount: BigInt(fill.executorFeeQuoteAmount),
   fillNonce:              fill.fillNonce,
+  makerCounterSet:        [],
+  takerCounterSet:        [],
 };
 
 // settlement already done above via namespace.execute()
