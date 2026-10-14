@@ -5,7 +5,7 @@
 // cryptographic checks; the evaluator then only does cheap, synchronous
 // cross-object checks (e.g. "was this revocation signed by the auth's owner").
 
-import { getAddress, verifyTypedData, createPublicClient, http, toEventSelector, type Address, type Hex } from "viem";
+import { getAddress, verifyTypedData, createPublicClient, http, parseAbiItem, decodeEventLog, keccak256, encodeAbiParameters, type Address, type Hex } from "viem";
 import type { AonObject } from "@intervalplace/aon-sdk";
 
 function stable(x: any): string {
@@ -26,6 +26,12 @@ async function verifySig(sig: any, expectedSigner: string, primaryType: string, 
   if (!ok) throw new Error(`${code}_BAD_SIGNATURE`);
 }
 
+export const counterSetHash = (legs: { orderHash: string; maxBase: string | bigint }[]) =>
+  keccak256(encodeAbiParameters(
+    [{ type: "tuple[]", components: [{ name: "orderHash", type: "bytes32" }, { name: "maxBase", type: "uint256" }] }],
+    [legs.map((l) => ({ orderHash: l.orderHash as Hex, maxBase: BigInt(l.maxBase) }))],
+  ));
+
 export async function validateOrderObject(obj: AonObject) {
   const o = (obj.payload as any)?.order;
   if (!o) throw new Error("MISSING_ORDER_PAYLOAD");
@@ -33,6 +39,20 @@ export async function validateOrderObject(obj: AonObject) {
   const sig = (obj as any).signature;
   if (stable(o) !== stable(sig?.message)) throw new Error("ORDER_PAYLOAD_MESSAGE_MISMATCH");
   await verifySig(sig, o.trader, "SignedOrder", "ORDER");
+
+  // Counter set: published next to the signed order as [{orderHash, maxBase}],
+  // must match the signed hash keccak256(abi.encode(legs))
+  const set = (obj.payload as any)?.counterSet;
+  const zero = /^0x0{64}$/i.test(String(o.counterSetHash ?? ""));
+  if (zero) {
+    if (set !== undefined && !(Array.isArray(set) && set.length === 0)) throw new Error("ORDER_COUNTER_SET_UNEXPECTED");
+  } else {
+    if (!Array.isArray(set) || set.length === 0 || set.length > 32) throw new Error("ORDER_COUNTER_SET_INVALID");
+    if (!set.every((l: any) => /^0x[0-9a-fA-F]{64}$/.test(String(l?.orderHash)) && /^\d+$/.test(String(l?.maxBase)))) throw new Error("ORDER_COUNTER_SET_INVALID");
+    if (new Set(set.map((l: any) => String(l.orderHash).toLowerCase())).size !== set.length) throw new Error("ORDER_COUNTER_SET_DUPLICATE");
+    if (counterSetHash(set).toLowerCase() !== String(o.counterSetHash).toLowerCase()) throw new Error("ORDER_COUNTER_SET_HASH_MISMATCH");
+  }
+  if (BigInt(o.exclusiveBase ?? 0) > BigInt(o.baseAmount)) throw new Error("ORDER_EXCLUSIVE_EXCEEDS_SIZE");
 }
 
 export function validateFillObject(obj: AonObject) {
@@ -66,15 +86,16 @@ export async function validateRevocationObject(obj: AonObject) {
 // ── Receipts ──────────────────────────────────────────────────────────────────
 // A receipt is published by whoever executed the fill and is unsigned, so it
 // proves nothing by itself. When the executor has an RPC (contract mode), we
-// check the claimed tx really emitted SpotTradeSettled for this fill's nonce
-// from the claimed settlement contract. Receipts that fail are dropped, so a
-// fake receipt can't make a fill look completed.
+// check the claimed tx succeeded and emitted SpotTradeSettled from the claimed
+// contract with exactly the receipt's claims: fill key, order hashes, nonce,
+// price, amounts and fee. The evaluator then checks those claims match the
+// fill and its orders. Receipts that fail are dropped.
 
-
-const SETTLED_TOPIC = toEventSelector(
-  "SpotTradeSettled(bytes32,bytes32,bytes32,bytes32,bytes32,address,address,address,address,address,address,address,uint256,uint256,uint256,uint256)"
+export const SETTLED_EVENT = parseAbiItem(
+  "event SpotTradeSettled(bytes32 indexed fillKey, bytes32 indexed makerOrderHash, bytes32 indexed takerOrderHash, bytes32 fillNonce, bytes32 makerAuthHash, bytes32 takerAuthHash, address maker, address taker, address seller, address buyer, address executor, address baseToken, address quoteToken, uint256 price, uint256 baseAmount, uint256 quoteAmount, uint256 executorFeeQuoteAmount)"
 );
 let rpcClient: ReturnType<typeof createPublicClient> | null = null;
+const lc = (x: any) => String(x ?? "").toLowerCase();
 
 export async function validateReceiptObject(obj: AonObject) {
   const rpc = process.env.AON_EVM_RPC_URL;
@@ -82,16 +103,25 @@ export async function validateReceiptObject(obj: AonObject) {
   const p = (obj.payload as any) ?? {};
   const txHash = String(p.executionTx ?? "");
   if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) throw new Error("RECEIPT_NOT_ONCHAIN");
-  if (!p.fillNonce || !p.settlementContract) throw new Error("RECEIPT_MISSING_FILL_BINDING");
+  for (const k of ["fillKey", "fillNonce", "makerOrderHash", "takerOrderHash", "settlementContract", "price", "baseAmount", "quoteAmount"]) {
+    if (p[k] === undefined || p[k] === null || p[k] === "") throw new Error("RECEIPT_MISSING_FILL_BINDING");
+  }
   const pinned = process.env.AON_EVM_SPOT_SETTLEMENT_CONTRACT;
-  if (pinned && pinned.toLowerCase() !== String(p.settlementContract).toLowerCase()) throw new Error("RECEIPT_WRONG_CONTRACT");
+  if (pinned && lc(pinned) !== lc(p.settlementContract)) throw new Error("RECEIPT_WRONG_CONTRACT");
 
   rpcClient ??= createPublicClient({ transport: http(rpc) });
   const r = await rpcClient.getTransactionReceipt({ hash: txHash as Hex }).catch(() => null);
   if (!r || r.status !== "success") throw new Error("RECEIPT_TX_NOT_SUCCESSFUL");
-  const ok = r.logs.some((l) =>
-    l.address.toLowerCase() === String(p.settlementContract).toLowerCase() &&
-    l.topics[0] === SETTLED_TOPIC &&
-    String(l.topics[1]).toLowerCase() === String(p.fillNonce).toLowerCase());
-  if (!ok) throw new Error("RECEIPT_EVENT_NOT_FOUND");
+  const matches = r.logs.some((l) => {
+    if (lc(l.address) !== lc(p.settlementContract)) return false;
+    let ev: any;
+    try { ev = decodeEventLog({ abi: [SETTLED_EVENT], data: l.data, topics: l.topics as any }); } catch { return false; }
+    const a = ev.args;
+    return lc(a.fillKey) === lc(p.fillKey) && lc(a.fillNonce) === lc(p.fillNonce)
+      && lc(a.makerOrderHash) === lc(p.makerOrderHash) && lc(a.takerOrderHash) === lc(p.takerOrderHash)
+      && String(a.price) === String(p.price) && String(a.baseAmount) === String(p.baseAmount)
+      && String(a.quoteAmount) === String(p.quoteAmount)
+      && String(a.executorFeeQuoteAmount) === String(p.executorFeeQuoteAmount ?? "0");
+  });
+  if (!matches) throw new Error("RECEIPT_EVENT_NOT_FOUND");
 }
