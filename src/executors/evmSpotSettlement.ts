@@ -4,11 +4,18 @@ import {
   http,
   getAddress,
   hashTypedData,
+  keccak256,
+  encodeAbiParameters,
+  decodeEventLog,
   defineChain,
   type Hex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { evmSpotNamespace } from "../namespace.js";
+import { SETTLED_EVENT } from "../validators/objects.js";
+
+const legsOf = (o: any) => (((o?.payload as any)?.counterSet ?? []) as any[]).map((l) => ({ orderHash: l.orderHash as Hex, maxBase: BigInt(l.maxBase) }));
+const ZERO32 = "0x0000000000000000000000000000000000000000000000000000000000000000";
 
 // ── ABI ───────────────────────────────────────────────────────────────────────
 
@@ -51,6 +58,9 @@ const abi = [
           { name: "validAfter",      type: "uint64"  },
           { name: "validBefore",     type: "uint64"  },
           { name: "receiveNative",   type: "bool"    },
+          { name: "counterSetHash",  type: "bytes32" },
+          { name: "exclusiveBase",   type: "uint256" },
+          { name: "exclusiveUntil",  type: "uint64"  },
         ],
       },
       { name: "makerOrderSig", type: "bytes" },
@@ -87,6 +97,9 @@ const abi = [
           { name: "validAfter",      type: "uint64"  },
           { name: "validBefore",     type: "uint64"  },
           { name: "receiveNative",   type: "bool"    },
+          { name: "counterSetHash",  type: "bytes32" },
+          { name: "exclusiveBase",   type: "uint256" },
+          { name: "exclusiveUntil",  type: "uint64"  },
         ],
       },
       { name: "takerOrderSig", type: "bytes" },
@@ -102,6 +115,8 @@ const abi = [
           { name: "quoteAmount",            type: "uint256" },
           { name: "executorFeeQuoteAmount", type: "uint256" },
           { name: "fillNonce",              type: "bytes32" },
+          { name: "makerCounterSet",        type: "tuple[]", components: [{ name: "orderHash", type: "bytes32" }, { name: "maxBase", type: "uint256" }] },
+          { name: "takerCounterSet",        type: "tuple[]", components: [{ name: "orderHash", type: "bytes32" }, { name: "maxBase", type: "uint256" }] },
         ],
       },
     ],
@@ -153,6 +168,9 @@ function orderTuple(o: any) {
     validAfter:      BigInt(o.validAfter),
     validBefore:     BigInt(o.validBefore),
     receiveNative:   o.receiveNative === true,
+    counterSetHash:  (o.counterSetHash ?? ZERO32) as Hex,
+    exclusiveBase:   BigInt(o.exclusiveBase ?? 0),
+    exclusiveUntil:  BigInt(o.exclusiveUntil ?? 0),
   };
 }
 
@@ -230,6 +248,10 @@ export async function executeEvmSpotOnEvm(args: { graph: any }) {
     quoteAmount:            BigInt(fill.quoteAmount),
     executorFeeQuoteAmount: BigInt(fill.executorFeeQuoteAmount ?? 0),
     fillNonce:              asHex(fill.fillNonce, "INVALID_FILL_NONCE"),
+    // Published alongside each order; the contract checks them against the
+    // signed counterSetHash, so they can't be altered.
+    makerCounterSet:        legsOf(graph.makerOrder),
+    takerCounterSet:        legsOf(graph.takerOrder),
   };
 
   const tx = await wallet.writeContract({
@@ -249,6 +271,20 @@ export async function executeEvmSpotOnEvm(args: { graph: any }) {
   // A reverted tx (e.g. another executor settled first) must not produce a receipt
   if (receipt.status !== "success") throw new Error(`SETTLEMENT_REVERTED: ${tx}`);
 
+  const fillKey = keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "bytes32" }, { type: "bytes32" }, { type: "uint256" }, { type: "uint256" }, { type: "uint256" }, { type: "uint256" }], [fillArg.fillNonce, makerOrderEip712, takerOrderEip712, fillArg.price, fillArg.baseAmount, fillArg.quoteAmount, fillArg.executorFeeQuoteAmount]));
+  // The contract settles as much of the fill as still fits, so the receipt
+  // reports the amounts from the event, not the ones submitted.
+  let settled: { baseAmount: string; quoteAmount: string; executorFeeQuoteAmount: string } | undefined;
+  for (const l of receipt.logs) {
+    if (l.address.toLowerCase() !== contract.toLowerCase()) continue;
+    try {
+      const ev: any = decodeEventLog({ abi: [SETTLED_EVENT], data: l.data, topics: l.topics as any });
+      if (String(ev.args.fillKey).toLowerCase() !== fillKey.toLowerCase()) continue;
+      settled = { baseAmount: String(ev.args.baseAmount), quoteAmount: String(ev.args.quoteAmount), executorFeeQuoteAmount: String(ev.args.executorFeeQuoteAmount) };
+    } catch {}
+  }
+  if (!settled) throw new Error(`SETTLEMENT_EVENT_MISSING: ${tx}`);
+
   return {
     executed:    true,
     mode:        "contract",
@@ -257,6 +293,11 @@ export async function executeEvmSpotOnEvm(args: { graph: any }) {
     details: {
       settlementContract: contract,
       executor:           account.address,
+      // Claims for the receipt; validateReceiptObject checks them on-chain
+      fillKey,
+      settled,
+      makerOrderHash:     makerOrderEip712,
+      takerOrderHash:     takerOrderEip712,
       tx,
       status:             receipt.status,
       blockNumber:        receipt.blockNumber.toString(),
