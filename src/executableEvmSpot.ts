@@ -1,4 +1,5 @@
 import type { AonObject } from "@intervalplace/aon-sdk";
+import { hashTypedData, keccak256, encodeAbiParameters, type Hex } from "viem";
 
 function refsLower(obj: any) {
   return (obj.references ?? []).map((x: string) => x.toLowerCase());
@@ -17,17 +18,78 @@ function fillData(fill: any) {
   return fill.payload?.fill ?? fill.payload ?? {};
 }
 
-// A receipt consumes a fill only if it references the fill AND carries the
-// fill's nonce (checked against the chain in validateReceiptObject).
+// A receipt consumes a fill only if every claim in it matches this exact
+// trade: the fill's nonce, price, amounts and fee, the contract, and the
+// EIP-712 hashes of the fill's two orders (from which the on-chain fill key
+// is derived). validateReceiptObject has already checked those claims against
+// the SpotTradeSettled event on-chain. Together that means a receipt from some
+// other trade (e.g. an attacker's own tiny trade reusing this nonce) can't
+// mark this fill as done.
+let genuineReceipts = new Map<string, any>(); // fill objectHash -> receipt (incl. duplicates of a settled fill)
+let creditedFills = new Set<string>();       // one fill objectHash per on-chain fill key
+
+const eipCache = new Map<string, string | null>();
+function orderEip712FromObject(order: any): string | null {
+  const k = String(order?.objectHash ?? "").toLowerCase();
+  if (k && eipCache.has(k)) return eipCache.get(k)!;
+  const sig = order?.signature;
+  let h: string | null = null;
+  if (sig?.domain && sig?.types && sig?.message) {
+    try { h = hashTypedData({ domain: sig.domain, types: sig.types, primaryType: "SignedOrder", message: sig.message } as any).toLowerCase(); }
+    catch { h = null; }
+  }
+  if (k) eipCache.set(k, h);
+  return h;
+}
+
+// The contract's replay key for a fill: every field of it
+export function fillKeyFor(f: any, makerOrderEip712: string, takerOrderEip712: string) {
+  return keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "bytes32" }, { type: "bytes32" }, { type: "uint256" }, { type: "uint256" }, { type: "uint256" }, { type: "uint256" }],
+    [f.fillNonce, makerOrderEip712 as Hex, takerOrderEip712 as Hex, BigInt(f.price), BigInt(f.baseAmount), BigInt(f.quoteAmount), BigInt(f.executorFeeQuoteAmount ?? 0)])).toLowerCase();
+}
+
+function computeGenuineReceipts(objects: any[], fills: any[], receipts: any[]) {
+  const byHash = new Map(objects.map((o: any) => [String(o.objectHash).toLowerCase(), o]));
+  const out = new Map<string, any>();
+  const credited = new Set<string>();
+  const byKey = new Map<string, any>(); // fill key -> the receipt that proved it
+  // Oldest first, so the original fill object is the one credited
+  const ordered = [...fills].sort((a: any, b: any) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+  const keyOf = new Map<string, string>();
+  for (const fill of ordered) {
+    const f = fillData(fill);
+    const mk = orderEip712FromObject(byHash.get(String(f.makerOrderHash ?? "").toLowerCase()));
+    const tk = orderEip712FromObject(byHash.get(String(f.takerOrderHash ?? "").toLowerCase()));
+    if (!mk || !tk || !f.fillNonce) continue;
+    let key: string;
+    try { key = fillKeyFor(f, mk, tk); } catch { continue; }
+    keyOf.set(String(fill.objectHash).toLowerCase(), key);
+    const contract = lower(f.settlementContract);
+    const fh = String(fill.objectHash).toLowerCase();
+    const r = receipts.find((r: any) => {
+      const p = r.payload ?? {};
+      return refsLower(r).includes(fh)
+        && lower(p.fillKey) === key
+        && lower(p.makerOrderHash) === mk && lower(p.takerOrderHash) === tk
+        && !!contract && lower(p.settlementContract) === contract;
+    });
+    if (r && !byKey.has(key)) byKey.set(key, r);
+  }
+  // Every fill object with a proven key counts as done, but each on-chain
+  // settlement is credited to exactly one fill object, so clones can't
+  // double-count it.
+  for (const fill of ordered) {
+    const fh = String(fill.objectHash).toLowerCase();
+    const key = keyOf.get(fh);
+    if (!key || !byKey.has(key)) continue;
+    out.set(fh, byKey.get(key));
+    if (![...credited].some((c) => keyOf.get(c) === key)) credited.add(fh);
+  }
+  return { out, credited };
+}
+
 function receiptConsumesFill(receipt: any, fill: any) {
-  const fillHash = fill.objectHash?.toLowerCase?.();
-  const nonce = fillData(fill).fillNonce?.toLowerCase?.();
-  if (!fillHash || !nonce) return false;
-  if (!refsLower(receipt).includes(fillHash)) return false;
-  if (receipt.payload?.fillNonce?.toLowerCase?.() !== nonce) return false;
-  // …and the event must come from the contract this fill settles on
-  const contract = fillData(fill).settlementContract?.toLowerCase?.();
-  return !!contract && receipt.payload?.settlementContract?.toLowerCase?.() === contract;
+  return genuineReceipts.get(String(fill.objectHash).toLowerCase()) === receipt;
 }
 
 function isFillReceipted(receipts: any[], fill: any) {
@@ -38,17 +100,18 @@ function orderHash(order: any) {
   return order.objectHash?.toLowerCase?.();
 }
 
+// Per-order totals are keyed by the order's EIP-712 hash, not its AON object
+// hash: a republished copy of an order object is the same signed order, so
+// fills pointing at either copy count toward the same total.
+let objIndex = new Map<string, any>();
+function eipOfOrderRef(ref: any): string | null {
+  return orderEip712FromObject(objIndex.get(String(ref ?? "").toLowerCase()));
+}
 function fillReferencesOrder(fill: any, order: any) {
-  const refs = refsLower(fill);
-  const h = orderHash(order);
-
-  if (!h) return false;
-
-  return (
-    refs.includes(h) ||
-    fillData(fill).makerOrderHash?.toLowerCase?.() === h ||
-    fillData(fill).takerOrderHash?.toLowerCase?.() === h
-  );
+  const target = orderEip712FromObject(order);
+  if (!target) return false;
+  const f = fillData(fill);
+  return eipOfOrderRef(f.makerOrderHash) === target || eipOfOrderRef(f.takerOrderHash) === target;
 }
 
 function sumReceiptedBaseForOrder(args: {
@@ -61,8 +124,11 @@ function sumReceiptedBaseForOrder(args: {
   for (const fill of args.fills) {
     if (!fillReferencesOrder(fill, args.order)) continue;
     if (!isFillReceipted(args.receipts, fill)) continue;
+    if (!creditedFills.has(String(fill.objectHash).toLowerCase())) continue; // count each settlement once
 
-    total += asBigInt(fillData(fill).baseAmount);
+    // what actually settled (the receipt's amount is checked against the event)
+    const r = genuineReceipts.get(String(fill.objectHash).toLowerCase());
+    total += asBigInt(r?.payload?.baseAmount ?? fillData(fill).baseAmount);
   }
 
   return total;
@@ -121,6 +187,8 @@ export function findExecutableEvmSpotGraphs(
       o.namespace === "aon:evm-spot" &&
       o.objectType === "receipt"
   );
+  objIndex = new Map((objects as any[]).map((o: any) => [String(o.objectHash).toLowerCase(), o]));
+  ({ out: genuineReceipts, credited: creditedFills } = computeGenuineReceipts(objects as any[], fills, receipts));
 
   const revocations = objects.filter(
     (o: any) =>
@@ -216,11 +284,10 @@ export function findExecutableEvmSpotGraphs(
     const takerRemaining =
       takerTotal > takerAlreadyFilled ? takerTotal - takerAlreadyFilled : 0n;
 
-    const wouldOverfillMaker =
-      makerTotal > 0n && makerAlreadyFilled + currentFillBase > makerTotal;
-
-    const wouldOverfillTaker =
-      takerTotal > 0n && takerAlreadyFilled + currentFillBase > takerTotal;
+    // The contract settles whatever part of a fill still fits, so a fill is
+    // only dead once one side has nothing left.
+    const wouldOverfillMaker = makerTotal > 0n && makerRemaining === 0n;
+    const wouldOverfillTaker = takerTotal > 0n && takerRemaining === 0n;
 
     const status = receipt
       ? "completed"

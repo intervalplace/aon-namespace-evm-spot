@@ -112,6 +112,10 @@ export async function buildEvmSpotOrderObject(body: {
     validBefore:     String(body.order.validBefore),
     // Buy orders only: be paid in native ETH instead of WETH
     receiveNative:   body.order.receiveNative === true,
+    // Front-running protection (see contract): zero = unbound
+    counterSetHash:  body.order.counterSetHash ?? "0x0000000000000000000000000000000000000000000000000000000000000000",
+    exclusiveBase:   String(body.order.exclusiveBase ?? 0),
+    exclusiveUntil:  String(body.order.exclusiveUntil ?? 0),
   };
 
   // sessionAuthHash is the EIP-712 hash of the authorization struct — what the

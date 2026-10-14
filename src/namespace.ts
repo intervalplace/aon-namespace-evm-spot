@@ -56,6 +56,9 @@ const ORDER_TYPES = {
     { name: "validAfter",      type: "uint64"  },
     { name: "validBefore",     type: "uint64"  },
     { name: "receiveNative",   type: "bool"    },
+    { name: "counterSetHash",  type: "bytes32" },
+    { name: "exclusiveBase",   type: "uint256" },
+    { name: "exclusiveUntil",  type: "uint64"  },
   ],
 };
 
@@ -194,9 +197,18 @@ export const evmSpotNamespace: EvmSpotDriver = {
         payload: {
           receiptType: "authorized_state_transition_completed",
           executionTx: result.executionTx,
-          // Binds the receipt to one fill so it can be checked on-chain
-          fillNonce: graph.fill?.payload?.fill?.fillNonce,
+          // Every claim below is checked against the on-chain event
+          // (validateReceiptObject) and against the fill (evaluator).
           settlementContract: result.details?.settlementContract,
+          fillKey: result.details?.fillKey,
+          fillNonce: graph.fill?.payload?.fill?.fillNonce,
+          makerOrderHash: result.details?.makerOrderHash,
+          takerOrderHash: result.details?.takerOrderHash,
+          price: String(graph.fill?.payload?.fill?.price),
+          // What actually moved (may be less than the fill if less was left)
+          baseAmount: String(result.details?.settled?.baseAmount ?? graph.fill?.payload?.fill?.baseAmount),
+          quoteAmount: String(result.details?.settled?.quoteAmount ?? graph.fill?.payload?.fill?.quoteAmount),
+          executorFeeQuoteAmount: String(result.details?.settled?.executorFeeQuoteAmount ?? graph.fill?.payload?.fill?.executorFeeQuoteAmount ?? "0"),
         },
       });
 
