@@ -3,6 +3,12 @@ pragma solidity ^0.8.20;
 
 interface IWETH {
     function withdraw(uint256 amount) external;
+    function deposit() external payable;
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+interface IBalance {
+    function balanceOf(address account) external view returns (uint256);
 }
 
 contract AonEvmSpotSettlement {
@@ -11,10 +17,11 @@ contract AonEvmSpotSettlement {
     );
 
     bytes32 public constant ORDER_TYPEHASH = keccak256(
-        "SignedOrder(address trader,bytes32 marketId,uint8 side,uint256 price,uint256 baseAmount,bytes32 orderNonce,bytes32 sessionAuthHash,uint64 validAfter,uint64 validBefore,bool receiveNative)"
+        "SignedOrder(address trader,bytes32 marketId,uint8 side,uint256 price,uint256 baseAmount,bytes32 orderNonce,bytes32 sessionAuthHash,uint64 validAfter,uint64 validBefore,bool receiveNative,bytes32 counterSetHash,uint256 exclusiveBase,uint64 exclusiveUntil)"
     );
 
-    bytes32 private immutable DOMAIN_SEPARATOR;
+    bytes32 private immutable CACHED_DOMAIN_SEPARATOR;
+    uint256 private immutable CACHED_CHAIN_ID;
 
     /// Wrapped native token (WETH on Ethereum). A buy order with
     /// receiveNative = true in a market whose base token is this address is
@@ -28,7 +35,23 @@ contract AonEvmSpotSettlement {
 
     mapping(bytes32 => bool) public revokedAuth;
     mapping(bytes32 => bool) public cancelledOrder;
-    mapping(bytes32 => bool) public usedFillNonce;
+    // Replay protection is keyed on every field of the fill, so reusing a
+    // published fill's nonce (even with the same orders but another size or
+    // price) is a different fill and can't burn the original.
+    // fillKey = keccak256(abi.encode(fillNonce, makerOrderHash, takerOrderHash,
+    //                                price, baseAmount, quoteAmount, executorFeeQuoteAmount))
+    // over the fill as submitted. If less fits, the fill settles what fits
+    // (SpotTradeSettled carries the amounts that actually moved) and its key
+    // is used up either way.
+    mapping(bytes32 => bool) public usedFill;
+
+    // Bound orders: base filled against named counterparties (the reserved
+    // part), per counterparty and in total
+    mapping(bytes32 => mapping(bytes32 => uint256)) public filledWithCounterparty;
+    mapping(bytes32 => uint256) public boundFilledBase;
+
+    // Gas forwarded to a buyer receiving native ETH; above that, they get WETH
+    uint256 public constant NATIVE_SEND_GAS = 50_000;
 
     mapping(bytes32 => uint256) public usedBaseByAuth;
     mapping(bytes32 => uint256) public usedQuoteByAuth;
@@ -65,6 +88,18 @@ contract AonEvmSpotSettlement {
         // Buy orders only: receive the base token as native ETH (base must be
         // WRAPPED_NATIVE). Signed, so no one else can choose it for the buyer.
         bool receiveNative;
+        // Front-running protection for the part of an order that fills
+        // immediately (the reserved part, exclusiveBase). Until exclusiveUntil,
+        // the reserved part may only fill against the legs in the counter set:
+        // up to each leg's maxBase in total, at exactly that counterparty's
+        // price. Nobody else may trade with the order until the
+        // reserved part has filled. Fills with anyone else never exceed
+        // baseAmount - exclusiveBase, so after the window the unfilled reserved
+        // part is simply void and the rest rests as a normal limit order.
+        // counterSetHash = keccak256(abi.encode(legs)). Zero = unbound.
+        bytes32 counterSetHash;
+        uint256 exclusiveBase;
+        uint64 exclusiveUntil;
     }
 
     struct FillInstruction {
@@ -77,12 +112,23 @@ contract AonEvmSpotSettlement {
         uint256 quoteAmount;
         uint256 executorFeeQuoteAmount;
         bytes32 fillNonce;
+        // The published counter sets of the two orders (empty if unbound)
+        CounterLeg[] makerCounterSet;
+        CounterLeg[] takerCounterSet;
+    }
+
+    // One named counterparty of a bound order: its EIP-712 order hash and the
+    // most base this order may fill against it while the binding is active.
+    struct CounterLeg {
+        bytes32 orderHash;
+        uint256 maxBase;
     }
 
     event SpotTradeSettled(
-        bytes32 indexed fillNonce,
+        bytes32 indexed fillKey,
         bytes32 indexed makerOrderHash,
         bytes32 indexed takerOrderHash,
+        bytes32 fillNonce,
         bytes32 makerAuthHash,
         bytes32 takerAuthHash,
         address maker,
@@ -102,6 +148,7 @@ contract AonEvmSpotSettlement {
     event OrderCancelled(bytes32 indexed orderHash, address indexed trader);
     event AuthorizationConsumed(bytes32 indexed authHash, uint256 usedBase, uint256 usedQuote, uint256 usedFee);
     event OrderFilled(bytes32 indexed orderHash, uint256 fillBase, uint256 cumulativeFilledBase);
+    event NativePayoutFellBackToWeth(address indexed buyer, uint256 amount);
 
     error BadSignature();
     error InvalidSettlementContract();
@@ -120,6 +167,13 @@ contract AonEvmSpotSettlement {
     error NativeTransferFailed();
     error Reentrancy();
     error ZeroAmount();
+    error CounterpartyNotAllowed(bytes32 orderHash);
+    error CounterSetMismatch(bytes32 orderHash);
+    error ReservedPartVoid(bytes32 orderHash);
+    error NotEnoughGasForPayout();
+    error CounterLegExceeded(bytes32 orderHash);
+    error ExecutorFeeTooHigh(bytes32 authHash);
+    error ReceivedLessThanSigned(address token, address recipient);
 
     modifier nonReentrant() {
         if (_lock != 1) revert Reentrancy();
@@ -130,7 +184,14 @@ contract AonEvmSpotSettlement {
 
     constructor(address wrappedNative) {
         WRAPPED_NATIVE = wrappedNative;
-        DOMAIN_SEPARATOR = keccak256(
+        CACHED_CHAIN_ID = block.chainid;
+        CACHED_DOMAIN_SEPARATOR = _buildDomainSeparator();
+    }
+
+    // Recomputed if the chain id ever changes (a fork), so signatures for one
+    // chain can't be replayed on the other.
+    function _buildDomainSeparator() private view returns (bytes32) {
+        return keccak256(
             abi.encode(
                 keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
                 keccak256(bytes("AON EVM Spot")),
@@ -141,13 +202,17 @@ contract AonEvmSpotSettlement {
         );
     }
 
+    function _domainSeparator() private view returns (bytes32) {
+        return block.chainid == CACHED_CHAIN_ID ? CACHED_DOMAIN_SEPARATOR : _buildDomainSeparator();
+    }
+
     /// Only accepts ETH from the wrapped-native contract while unwrapping.
     receive() external payable {
         if (msg.sender != WRAPPED_NATIVE) revert NativeTransferFailed();
     }
 
     function domainSeparator() external view returns (bytes32) {
-        return DOMAIN_SEPARATOR;
+        return _domainSeparator();
     }
 
     function hashTradingSessionAuthorization(
@@ -173,7 +238,7 @@ contract AonEvmSpotSettlement {
             )
         );
 
-        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
     }
 
     function hashSignedOrder(
@@ -191,11 +256,14 @@ contract AonEvmSpotSettlement {
                 order.sessionAuthHash,
                 order.validAfter,
                 order.validBefore,
-                order.receiveNative
+                order.receiveNative,
+                order.counterSetHash,
+                order.exclusiveBase,
+                order.exclusiveUntil
             )
         );
 
-        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+        return keccak256(abi.encodePacked("\x19\x01", _domainSeparator(), structHash));
     }
 
     function revokeAuthorization(TradingSessionAuthorization calldata auth) external {
@@ -238,7 +306,12 @@ contract AonEvmSpotSettlement {
         if (fill.takerAuthHash != takerAuthHash) revert InvalidMarket();
         if (fill.makerOrderHash != makerOrderHash) revert InvalidMarket();
         if (fill.takerOrderHash != takerOrderHash) revert InvalidMarket();
-        if (usedFillNonce[fill.fillNonce]) revert FillReplay(fill.fillNonce);
+        bytes32 fillKey = keccak256(abi.encode(
+            fill.fillNonce, makerOrderHash, takerOrderHash,
+            fill.price, fill.baseAmount, fill.quoteAmount, fill.executorFeeQuoteAmount
+        ));
+        if (usedFill[fillKey]) revert FillReplay(fill.fillNonce);
+        if (fill.quoteAmount == 0) revert ZeroAmount();
 
         _verifyAuth(makerAuth, makerAuthSig, makerAuthHash);
         _verifyAuth(takerAuth, takerAuthSig, takerAuthHash);
@@ -248,21 +321,33 @@ contract AonEvmSpotSettlement {
 
         _verifyFill(makerAuth, makerOrder, takerAuth, takerOrder, fill);
 
-        if (filledBaseByOrder[makerOrderHash] + fill.baseAmount > makerOrder.baseAmount) {
-            revert OrderAmountExceeded(makerOrderHash);
-        }
+        // Settle as much of the fill as still fits: what's left of both orders
+        // and, for bound orders, of the named leg or the unreserved part.
+        // Fill sizes aren't signed by anyone, so clamping grants nothing new;
+        // it means someone settling a sliver first can't make the rest revert.
+        // If nothing fits, revert with the reason.
+        uint256 base = fill.baseAmount;
+        base = _min(base, _bindingRoom(makerOrder, makerOrderHash, takerOrderHash, takerOrder.price, fill.makerCounterSet, fill.price));
+        base = _min(base, _bindingRoom(takerOrder, takerOrderHash, makerOrderHash, makerOrder.price, fill.takerCounterSet, fill.price));
+        base = _min(base, _orderRoom(makerOrder, makerOrderHash));
+        base = _min(base, _orderRoom(takerOrder, takerOrderHash));
 
-        if (filledBaseByOrder[takerOrderHash] + fill.baseAmount > takerOrder.baseAmount) {
-            revert OrderAmountExceeded(takerOrderHash);
-        }
+        uint256 quote = (base * fill.price) / 1e18;
+        if (quote == 0) revert ZeroAmount();
+        // The executor fee scales down with the fill (rounded down)
+        uint256 fee = base == fill.baseAmount
+            ? fill.executorFeeQuoteAmount
+            : (fill.executorFeeQuoteAmount * base) / fill.baseAmount;
 
-        usedFillNonce[fill.fillNonce] = true;
+        usedFill[fillKey] = true;
 
-        filledBaseByOrder[makerOrderHash] += fill.baseAmount;
-        filledBaseByOrder[takerOrderHash] += fill.baseAmount;
+        _recordBinding(makerOrder, makerOrderHash, takerOrderHash, fill.makerCounterSet, base);
+        _recordBinding(takerOrder, takerOrderHash, makerOrderHash, fill.takerCounterSet, base);
+        filledBaseByOrder[makerOrderHash] += base;
+        filledBaseByOrder[takerOrderHash] += base;
 
-        _consumeExposure(makerAuthHash, makerAuth, makerOrder, fill);
-        _consumeExposure(takerAuthHash, takerAuth, takerOrder, fill);
+        _consumeExposure(makerAuthHash, makerAuth, makerOrder, base, quote, fee);
+        _consumeExposure(takerAuthHash, takerAuth, takerOrder, base, quote, fee);
 
         address seller;
         address buyer;
@@ -281,33 +366,57 @@ contract AonEvmSpotSettlement {
 
         // Quote legs first; the native payout (an external call to the buyer)
         // goes last, after every state change and token transfer.
-        _safeTransferFrom(makerAuth.quoteToken, buyer, seller, fill.quoteAmount);
+        // The seller must actually receive the full quote amount they signed
+        // for (e.g. if the quote token ever charges a transfer fee).
+        uint256 sellerQuoteBefore = IBalance(makerAuth.quoteToken).balanceOf(seller);
+        _safeTransferFrom(makerAuth.quoteToken, buyer, seller, quote);
+        if (IBalance(makerAuth.quoteToken).balanceOf(seller) < sellerQuoteBefore + quote) {
+            revert ReceivedLessThanSigned(makerAuth.quoteToken, seller);
+        }
 
-        if (fill.executorFeeQuoteAmount > 0) {
+        if (fee > 0) {
             _safeTransferFrom(
                 makerAuth.quoteToken,
                 buyer,
                 msg.sender,
-                fill.executorFeeQuoteAmount
+                fee
             );
         }
 
         if (payNative) {
-            _safeTransferFrom(makerAuth.baseToken, seller, address(this), fill.baseAmount);
-            IWETH(WRAPPED_NATIVE).withdraw(fill.baseAmount);
-            (bool sent, ) = buyer.call{value: fill.baseAmount}("");
-            if (!sent) revert NativeTransferFailed();
+            uint256 heldBefore = IBalance(WRAPPED_NATIVE).balanceOf(address(this));
+            _safeTransferFrom(makerAuth.baseToken, seller, address(this), base);
+            if (IBalance(WRAPPED_NATIVE).balanceOf(address(this)) < heldBefore + base) {
+                revert ReceivedLessThanSigned(WRAPPED_NATIVE, address(this));
+            }
+            IWETH(WRAPPED_NATIVE).withdraw(base);
+            // Make sure the buyer's call really gets NATIVE_SEND_GAS (the 63/64
+            // rule), so an executor can't force the WETH fallback with a tight limit.
+            if (gasleft() < (NATIVE_SEND_GAS * 64) / 63 + 10_000) revert NotEnoughGasForPayout();
+            // Gas-capped so a buyer's wallet can't burn the executor's gas; if
+            // the wallet won't take ETH, the buyer gets WETH instead.
+            (bool sent, ) = buyer.call{value: base, gas: NATIVE_SEND_GAS}("");
+            if (!sent) {
+                IWETH(WRAPPED_NATIVE).deposit{value: base}();
+                if (!IWETH(WRAPPED_NATIVE).transfer(buyer, base)) revert NativeTransferFailed();
+                emit NativePayoutFellBackToWeth(buyer, base);
+            }
         } else {
-            _safeTransferFrom(makerAuth.baseToken, seller, buyer, fill.baseAmount);
+            uint256 buyerBaseBefore = IBalance(makerAuth.baseToken).balanceOf(buyer);
+            _safeTransferFrom(makerAuth.baseToken, seller, buyer, base);
+            if (IBalance(makerAuth.baseToken).balanceOf(buyer) < buyerBaseBefore + base) {
+                revert ReceivedLessThanSigned(makerAuth.baseToken, buyer);
+            }
         }
 
-        emit OrderFilled(makerOrderHash, fill.baseAmount, filledBaseByOrder[makerOrderHash]);
-        emit OrderFilled(takerOrderHash, fill.baseAmount, filledBaseByOrder[takerOrderHash]);
+        emit OrderFilled(makerOrderHash, base, filledBaseByOrder[makerOrderHash]);
+        emit OrderFilled(takerOrderHash, base, filledBaseByOrder[takerOrderHash]);
 
         emit SpotTradeSettled(
-            fill.fillNonce,
+            fillKey,
             makerOrderHash,
             takerOrderHash,
+            fill.fillNonce,
             makerAuthHash,
             takerAuthHash,
             makerAuth.grantor,
@@ -318,9 +427,9 @@ contract AonEvmSpotSettlement {
             makerAuth.baseToken,
             makerAuth.quoteToken,
             fill.price,
-            fill.baseAmount,
-            fill.quoteAmount,
-            fill.executorFeeQuoteAmount
+            base,
+            quote,
+            fee
         );
     }
 
@@ -361,6 +470,65 @@ contract AonEvmSpotSettlement {
         }
 
         if (_recover(orderHash, sig) != order.trader) revert BadSignature();
+    }
+
+    // How much of a fill a bound order can take from this counterparty right
+    // now. Reverts when the answer is nothing (or the fill breaks the binding).
+    function _bindingRoom(
+        SignedOrder calldata order,
+        bytes32 orderHash,
+        bytes32 counterHash,
+        uint256 counterPrice,
+        CounterLeg[] calldata legs,
+        uint256 fillPrice
+    ) internal view returns (uint256) {
+        if (order.counterSetHash == bytes32(0)) return type(uint256).max;
+
+        if (block.timestamp < order.exclusiveUntil) {
+            if (keccak256(abi.encode(legs)) != order.counterSetHash) revert CounterSetMismatch(orderHash);
+            for (uint256 i = 0; i < legs.length; i++) {
+                if (legs[i].orderHash != counterHash) continue;
+                // A named leg: at exactly its price, up to its signed amount in total
+                if (fillPrice != counterPrice) revert InvalidPrice();
+                uint256 used = filledWithCounterparty[orderHash][counterHash];
+                if (used >= legs[i].maxBase) revert CounterLegExceeded(orderHash);
+                return legs[i].maxBase - used;
+            }
+            // Not a named leg: nobody else trades with it until the reserved part is done
+            if (boundFilledBase[orderHash] < order.exclusiveBase) revert CounterpartyNotAllowed(orderHash);
+        }
+
+        // Fills with anyone else are limited to the unreserved part
+        uint256 unbound = filledBaseByOrder[orderHash] - boundFilledBase[orderHash];
+        uint256 cap = order.baseAmount - order.exclusiveBase;
+        if (unbound >= cap) revert ReservedPartVoid(orderHash);
+        return cap - unbound;
+    }
+
+    function _recordBinding(
+        SignedOrder calldata order,
+        bytes32 orderHash,
+        bytes32 counterHash,
+        CounterLeg[] calldata legs,
+        uint256 base
+    ) internal {
+        if (order.counterSetHash == bytes32(0) || block.timestamp >= order.exclusiveUntil) return;
+        for (uint256 i = 0; i < legs.length; i++) {
+            if (legs[i].orderHash != counterHash) continue;
+            filledWithCounterparty[orderHash][counterHash] += base;
+            boundFilledBase[orderHash] += base;
+            return;
+        }
+    }
+
+    function _orderRoom(SignedOrder calldata order, bytes32 orderHash) internal view returns (uint256) {
+        uint256 filled = filledBaseByOrder[orderHash];
+        if (filled >= order.baseAmount) revert OrderAmountExceeded(orderHash);
+        return order.baseAmount - filled;
+    }
+
+    function _min(uint256 a, uint256 b) internal pure returns (uint256) {
+        return a < b ? a : b;
     }
 
     function _verifyFill(
@@ -413,19 +581,31 @@ contract AonEvmSpotSettlement {
         bytes32 authHash,
         TradingSessionAuthorization calldata auth,
         SignedOrder calldata order,
-        FillInstruction calldata fill
+        uint256 base,
+        uint256 quote,
+        uint256 fee
     ) internal {
         if (order.side == SIDE_SELL_BASE) {
-            uint256 nextBase = usedBaseByAuth[authHash] + fill.baseAmount;
+            uint256 nextBase = usedBaseByAuth[authHash] + base;
             if (nextBase > auth.maxBaseExposure) revert AuthExposureExceeded(authHash);
 
             usedBaseByAuth[authHash] = nextBase;
         } else if (order.side == SIDE_BUY_BASE) {
-            uint256 nextQuote = usedQuoteByAuth[authHash] + fill.quoteAmount;
-            uint256 nextFee = usedExecutorFeeQuoteByAuth[authHash] + fill.executorFeeQuoteAmount;
+            uint256 nextQuote = usedQuoteByAuth[authHash] + quote;
+            uint256 nextFee = usedExecutorFeeQuoteByAuth[authHash] + fee;
 
             if (nextQuote > auth.maxQuoteExposure) revert AuthExposureExceeded(authHash);
             if (nextFee > auth.maxExecutorFeeQuote) revert AuthExposureExceeded(authHash);
+            // The fee is capped in proportion to this fill's share of everything
+            // the authorization may spend, so a small fill can only carry a small
+            // fee. Written as a division so an "unlimited" cap can't overflow.
+            if (fee > 0) {
+                if (auth.maxQuoteExposure == 0) revert ExecutorFeeTooHigh(authHash);
+                uint256 allowed = auth.maxExecutorFeeQuote > type(uint256).max / quote
+                    ? type(uint256).max
+                    : (auth.maxExecutorFeeQuote * quote) / auth.maxQuoteExposure;
+                if (fee > allowed) revert ExecutorFeeTooHigh(authHash);
+            }
 
             usedQuoteByAuth[authHash] = nextQuote;
             usedExecutorFeeQuoteByAuth[authHash] = nextFee;
