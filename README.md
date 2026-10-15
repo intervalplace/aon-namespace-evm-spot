@@ -90,6 +90,12 @@ await runExecutor({
 });
 ```
 
+> **For a real executor, call `validateObject` on every object before
+> evaluating.** The SDK's `runExecutor` evaluates objects as they come from the
+> node without validating them, so a forged receipt or revocation could make it
+> skip real trades. [covenant-executor](https://github.com/intervalplace/covenant-v2/tree/main/covenant-executor)
+> is a ready-to-run executor that does this.
+
 ## Exports
 
 ```ts
